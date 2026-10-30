@@ -9,6 +9,7 @@ import comfy.model_management
 from server import PromptServer
 from comfy_extras.mesh3d.postprocess.qem_decimate import QEMConfig, qem_simplify, qem_cluster_decimate, _compute_vertex_normals, _connected_labels
 from comfy_extras.mesh3d.postprocess.remesh import remesh_narrow_band_dc, _point_tri_closest
+from comfy_extras.mesh3d.postprocess.plane_cut import plane_cut_mesh
 from comfy_extras.nodes_save_3d import get_mesh_batch_item, pack_variable_mesh_batch
 from comfy_extras.mesh3d.uv_unwrap import mesh as _uv_mesh
 from comfy_extras.mesh3d.uv_unwrap import segment as _uv_seg
@@ -3142,12 +3143,117 @@ class MeshSmoothNormals(IO.ComfyNode):
         return IO.NodeOutput(out)
 
 
+class MeshPlaneCut(IO.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="MeshPlaneCut",
+            display_name="Plane Cut Mesh",
+            category="3d/mesh",
+            description=(
+                "Cuts a closed outward-facing manifold triangle mesh at a model-space Y "
+                "height, keeps the part above the plane and caps the section with "
+                "downward-facing triangles. Concave outlines and inner holes are kept; "
+                "disconnected sections are capped separately. A plane below the mesh "
+                "leaves it unchanged; a plane above it outputs an empty mesh."
+            ),
+            inputs=[
+                IO.Mesh.Input("mesh"),
+                IO.Float.Input("height", default=0.0, step=0.001,
+                               tooltip="Cut height in model-space Y; the part with y >= height is kept."),
+            ],
+            outputs=[IO.Mesh.Output("mesh")],
+        )
+
+    @classmethod
+    def execute(cls, mesh, height):
+        h = float(height)
+
+        def cut_one(v, f, c):
+            # Returns (vertices, faces, colors, changed). Plane at/below the bottom is a
+            # no-op; at/above the top yields an empty item.
+            y_min = float(v[:, 1].min())
+            if y_min >= h:
+                return v, f, c, False
+            y_max = float(v[:, 1].max())
+            if y_max <= h:
+                return (v.new_zeros((0, 3)),
+                        f.new_zeros((0, 3), dtype=torch.int32),
+                        c.new_zeros((0, c.shape[1])) if c is not None else None,
+                        True)
+            nv, nf, nc = plane_cut_mesh(
+                v.detach().cpu().numpy(),
+                f.detach().cpu().numpy(),
+                h,
+                c.detach().cpu().numpy() if c is not None else None,
+            )
+            out_c = None
+            if c is not None:
+                out_c = torch.from_numpy(np.ascontiguousarray(nc)).to(device=v.device, dtype=c.dtype)
+            return (torch.from_numpy(np.ascontiguousarray(nv)).to(device=v.device, dtype=v.dtype),
+                    torch.from_numpy(np.ascontiguousarray(nf)).to(device=f.device),
+                    out_c, True)
+
+        is_list = isinstance(mesh.vertices, list)
+        has_colors = mesh.vertex_colors is not None
+        if is_list or mesh.vertices.ndim == 3:
+            bsz = len(mesh.vertices)
+            bar = comfy.utils.ProgressBar(bsz)
+            v_list, f_list, c_list = [], [], []
+            changed = False
+            for i in range(bsz):
+                if is_list:
+                    v_i, f_i = mesh.vertices[i], mesh.faces[i]
+                    c_i = None
+                    if has_colors:
+                        c_i = mesh.vertex_colors[i] if isinstance(mesh.vertex_colors, list) else mesh.vertex_colors
+                else:
+                    v_i, f_i, c_i, _, _ = get_mesh_batch_item(mesh, i)
+                v_i, f_i, c_i, item_changed = cut_one(v_i, f_i, c_i)
+                changed = changed or item_changed
+                v_list.append(v_i)
+                f_list.append(f_i)
+                if has_colors:
+                    c_list.append(c_i)
+                bar.update(1)
+            if not changed:
+                return IO.NodeOutput(mesh)
+            if is_list:
+                out = copy.copy(mesh)
+                out.vertices = v_list
+                out.faces = f_list
+                if has_colors:
+                    out.vertex_colors = c_list
+            else:
+                out = pack_variable_mesh_batch(
+                    v_list, f_list, c_list if has_colors else None,
+                    texture=mesh.texture, unlit=mesh.unlit,
+                    metallic_roughness=mesh.metallic_roughness,
+                    normal_map=mesh.normal_map,
+                    occlusion_in_mr=mesh.occlusion_in_mr,
+                    material=mesh.material, emissive=mesh.emissive)
+            return IO.NodeOutput(out)
+
+        v, f, c, changed = cut_one(mesh.vertices, mesh.faces, mesh.vertex_colors)
+        if not changed:
+            return IO.NodeOutput(mesh)
+        out = pack_variable_mesh_batch(
+            [v], [f], [c] if c is not None else None,
+            texture=mesh.texture, unlit=mesh.unlit,
+            metallic_roughness=mesh.metallic_roughness,
+            normal_map=mesh.normal_map,
+            occlusion_in_mr=mesh.occlusion_in_mr,
+            material=mesh.material, emissive=mesh.emissive)
+        return IO.NodeOutput(out)
+
+
 class PostProcessMeshExtension(ComfyExtension):
     @override
     async def get_node_list(self) -> list[type[IO.ComfyNode]]:
         return [
             FillHoles,
             WeldVertices,
+            MeshPlaneCut,
             DecimateMesh,
             RemeshMesh,
             UnwrapMesh,
